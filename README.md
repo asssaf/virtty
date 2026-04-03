@@ -13,7 +13,11 @@
 
 ## Usage
 
-To use `virtty`, add parameters to your kernel command line. For example, to proxy `ttyS0` at 115200 baud to `virtty0` and use it as your system console:
+`virtty` can be configured as a built-in driver or a loadable module.
+
+### Built-in Usage
+
+When built into the kernel, use the following syntax in the kernel command line:
 
 ```
 virtty0=ttyS0,115200 console=virtty0
@@ -24,7 +28,21 @@ This will:
 2. Pass the `115200` option to the `ttyS` console setup function.
 3. Register `virtty0` as a system console.
 
-**Note:** For `console=virttyN` to capture early boot messages (before modules are loaded), the `virtty` module must be built into the kernel rather than loaded as a module. As a loadable module, it will start proxying console output as soon as it is loaded and initialized.
+### Module Usage
+
+When loaded as a module, use module parameters to configure instances:
+
+```bash
+sudo modprobe virtty v0=ttyS0,115200
+```
+
+Or via the kernel command line:
+
+```
+virtty.v0=ttyS0,115200 console=virtty0
+```
+
+**Note:** For `console=virttyN` to capture early boot messages (before modules are loaded), the `virtty` module must be built into the kernel image. As a loadable module, it will start proxying console output as soon as it is loaded and initialized.
 
 ## Building
 
