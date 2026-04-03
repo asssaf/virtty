@@ -24,6 +24,8 @@ This will:
 2. Pass the `115200` option to the `ttyS` console setup function.
 3. Register `virtty0` as a system console.
 
+**Note:** For `console=virttyN` to capture early boot messages (before modules are loaded), the `virtty` module must be built into the kernel rather than loaded as a module. As a loadable module, it will start proxying console output as soon as it is loaded and initialized.
+
 ## Building
 
 ### Using the Makefile

@@ -10,6 +10,7 @@
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/string.h>
+#include <linux/version.h>
 
 #define DRIVER_NAME "virtty"
 #define DEVICE_NAME "virtty"
@@ -27,6 +28,7 @@ struct virtty_port {
     struct tty_struct *slave_tty;
     struct file *slave_file;
     struct mutex lock;
+    struct console console; // Embed console in the port
     struct console *slave_console;
 };
 
@@ -39,10 +41,14 @@ static void __init virtty_parse_cmdline(void) {
     int index;
     static char cmdline[COMMAND_LINE_SIZE];
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
     strscpy(cmdline, boot_command_line, COMMAND_LINE_SIZE);
+#else
+    strlcpy(cmdline, boot_command_line, COMMAND_LINE_SIZE);
+#endif
     p = cmdline;
 
-    while ((p = strstr(p, "virtty")) != NULL) {
+    while (p && (p = strstr(p, "virtty")) != NULL) {
         token = strsep(&p, " ");
         if (!token) break;
 
@@ -55,7 +61,11 @@ static void __init virtty_parse_cmdline(void) {
             if (!virtty_instances[index]) {
                 virtty_instances[index] = kzalloc(sizeof(struct virtty_instance), GFP_KERNEL);
                 if (virtty_instances[index]) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
                     strscpy(virtty_instances[index]->slave_config, config, 128);
+#else
+                    strlcpy(virtty_instances[index]->slave_config, config, 128);
+#endif
                     virtty_instances[index]->index = index;
                     pr_info("virtty: instance %d configured with %s\n", index, config);
                 }
@@ -202,8 +212,7 @@ static const struct tty_operations virtty_ops = {
 };
 
 static void virtty_console_write(struct console *co, const char *s, unsigned int count) {
-    struct virtty_port *vport = (co->index >= 0 && co->index < MAX_DEVICES) ? virtty_ports[co->index] : NULL;
-
+    struct virtty_port *vport = container_of(co, struct virtty_port, console);
     if (vport && vport->slave_console && vport->slave_console->write) {
         vport->slave_console->write(vport->slave_console, s, count);
     }
@@ -215,19 +224,10 @@ static struct tty_driver *virtty_console_device(struct console *co, int *index) 
 }
 
 static int virtty_console_setup(struct console *co, char *options) {
-    if (co->index < 0 || co->index >= MAX_DEVICES || !virtty_ports[co->index])
-        return -ENODEV;
+    struct virtty_port *vport = container_of(co, struct virtty_port, console);
+    if (!vport) return -ENODEV;
     return 0;
 }
-
-static struct console virtty_console = {
-    .name = DEVICE_NAME,
-    .write = virtty_console_write,
-    .device = virtty_console_device,
-    .setup = virtty_console_setup,
-    .flags = CON_PRINTBUFFER | CON_ANYTIME,
-    .index = -1,
-};
 
 static int __init virtty_init(void) {
     int i, ret;
@@ -278,6 +278,7 @@ static int __init virtty_init(void) {
                 options = config;
                 slave_name = strsep(&options, ",");
 
+                // Search for slave console and proxy options
                 console_lock();
                 for_each_console(c) {
                     if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
@@ -291,16 +292,25 @@ static int __init virtty_init(void) {
                 console_unlock();
                 kfree(config);
             }
+
+            // Setup console for this port
+            strscpy(virtty_ports[i]->console.name, DEVICE_NAME, sizeof(virtty_ports[i]->console.name));
+            virtty_ports[i]->console.write = virtty_console_write;
+            virtty_ports[i]->console.device = virtty_console_device;
+            virtty_ports[i]->console.setup = virtty_console_setup;
+            virtty_ports[i]->console.flags = CON_PRINTBUFFER | CON_ANYTIME | CON_ENABLED;
+            virtty_ports[i]->console.index = i;
+            register_console(&virtty_ports[i]->console);
         }
     }
 
-    register_console(&virtty_console);
     pr_info("virtty: driver initialized\n");
     return 0;
 
 err_ports:
     for (i = 0; i < MAX_DEVICES; i++) {
         if (virtty_ports[i]) {
+            unregister_console(&virtty_ports[i]->console);
             tty_unregister_device(virtty_driver, i);
             tty_port_destroy(&virtty_ports[i]->port);
             kfree(virtty_ports[i]);
@@ -321,11 +331,11 @@ err_out:
 static void __exit virtty_exit(void) {
     int i;
 
-    unregister_console(&virtty_console);
     tty_unregister_ldisc(&virtty_ldisc_ops);
 
     for (i = 0; i < MAX_DEVICES; i++) {
         if (virtty_ports[i]) {
+            unregister_console(&virtty_ports[i]->console);
             if (virtty_ports[i]->slave_tty) {
                 tty_kclose(virtty_ports[i]->slave_tty);
             }
