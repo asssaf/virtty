@@ -12,6 +12,7 @@
 #include <linux/string.h>
 #include <linux/version.h>
 #include <linux/serial_core.h>
+#include <linux/setup.h>
 
 #define DRIVER_NAME "virtty"
 #define DEVICE_NAME "virtty"
@@ -29,7 +30,7 @@ struct virtty_port {
     struct tty_struct *slave_tty;
     struct file *slave_file;
     struct mutex lock;
-    struct console console; // Embed console in the port
+    struct console console;
     struct console *slave_console;
 };
 
@@ -85,7 +86,7 @@ static int virtty_install(struct tty_driver *driver, struct tty_struct *tty) {
 
 static void virtty_receive_buf(struct tty_struct *tty, const u8 *cp, const u8 *fp, size_t count) {
     struct virtty_port *vport = tty->disc_data;
-    if (vport && vport->port.tty) {
+    if (vport && vport->port.itty) {
         tty_insert_flip_string(&vport->port, cp, count);
         tty_flip_buffer_push(&vport->port);
     }
@@ -278,42 +279,37 @@ static int __init virtty_init(void) {
             if (config) {
                 options = config;
                 slave_name = strsep(&options, ",");
-
-                // Search for slave console and proxy options
+                if (slave_name) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
-                {
+                    int idx = console_srcu_read_lock();
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+                    for_each_console_srcu(c) {
+#else
                     struct console_srcu_iter iter;
-                    int idx;
-
-                    idx = console_srcu_read_lock();
                     for_each_console_srcu(c, &iter) {
+#endif
                         if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
                             virtty_ports[i]->slave_console = c;
-                            if (options && c->setup) {
-                                c->setup(c, options);
-                            }
+                            if (options && c->setup) c->setup(c, options);
                             break;
                         }
                     }
                     console_srcu_read_unlock(idx);
-                }
 #else
-                console_lock();
-                for_each_console(c) {
-                    if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
-                        virtty_ports[i]->slave_console = c;
-                        if (options && c->setup) {
-                            c->setup(c, options);
+                    console_lock();
+                    for_each_console(c) {
+                        if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
+                            virtty_ports[i]->slave_console = c;
+                            if (options && c->setup) c->setup(c, options);
+                            break;
                         }
-                        break;
                     }
-                }
-                console_unlock();
+                    console_unlock();
 #endif
+                }
                 kfree(config);
             }
 
-            // Setup console for this port
             strscpy(virtty_ports[i]->console.name, DEVICE_NAME, sizeof(virtty_ports[i]->console.name));
             virtty_ports[i]->console.write = virtty_console_write;
             virtty_ports[i]->console.device = virtty_console_device;
@@ -338,7 +334,11 @@ err_ports:
     }
     tty_unregister_driver(virtty_driver);
 err_put:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+    tty_driver_kref_put(virtty_driver);
+#else
     put_tty_driver(virtty_driver);
+#endif
 err_ldisc:
     tty_unregister_ldisc(&virtty_ldisc_ops);
 err_out:
@@ -350,28 +350,24 @@ err_out:
 
 static void __exit virtty_exit(void) {
     int i;
-
-    tty_unregister_ldisc(&virtty_ldisc_ops);
-
     for (i = 0; i < MAX_DEVICES; i++) {
         if (virtty_ports[i]) {
             unregister_console(&virtty_ports[i]->console);
-            if (virtty_ports[i]->slave_tty) {
-                tty_kclose(virtty_ports[i]->slave_tty);
-            }
-            if (virtty_ports[i]->slave_file) {
-                filp_close(virtty_ports[i]->slave_file, NULL);
-            }
+            if (virtty_ports[i]->slave_tty) tty_kclose(virtty_ports[i]->slave_tty);
+            if (virtty_ports[i]->slave_file) filp_close(virtty_ports[i]->slave_file, NULL);
             tty_unregister_device(virtty_driver, i);
             tty_port_destroy(&virtty_ports[i]->port);
             kfree(virtty_ports[i]);
         }
-        if (virtty_instances[i]) {
-            kfree(virtty_instances[i]);
-        }
+        if (virtty_instances[i]) kfree(virtty_instances[i]);
     }
+    tty_unregister_ldisc(&virtty_ldisc_ops);
     tty_unregister_driver(virtty_driver);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+    tty_driver_kref_put(virtty_driver);
+#else
     put_tty_driver(virtty_driver);
+#endif
     pr_info("virtty: driver exited\n");
 }
 
