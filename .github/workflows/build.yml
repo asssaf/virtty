@@ -1,0 +1,35 @@
+name: Build virtty Kernel Module
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      KERNEL_VERSION: "6.12.25"
+
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      with:
+        persist-credentials: false
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc bison flex libelf-dev libssl-dev build-essential
+
+    - name: Download Kernel Headers
+      run: |
+        wget https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-${{ env.KERNEL_VERSION }}.tar.xz
+        tar -xvf linux-${{ env.KERNEL_VERSION }}.tar.xz
+        cd linux-${{ env.KERNEL_VERSION }}
+        make defconfig
+        make modules_prepare
+
+    - name: Build Module
+      run: |
+        make -C linux-${{ env.KERNEL_VERSION }} M=$PWD modules
