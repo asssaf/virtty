@@ -12,7 +12,7 @@
 #include <linux/string.h>
 #include <linux/version.h>
 #include <linux/serial_core.h>
-#include <linux/setup.h>
+#include <asm/setup.h>
 
 #define DRIVER_NAME "virtty"
 #define DEVICE_NAME "virtty"
