@@ -1,6 +1,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
 #include <linux/tty_flip.h>
@@ -9,12 +10,15 @@
 #include <linux/tty_ldisc.h>
 #include <linux/notifier.h>
 #include <linux/device.h>
-#include <linux/tty_driver.h>
 #include <linux/serial.h>
 #include <linux/ctype.h>
 #include "virtty.h"
 
-#define N_VIRTTY_SLAVE 29 /* Custom line discipline ID, we'll pick one */
+/*
+ * LDisc 30 is generally unassigned.
+ * Standard values: 0=TTY, 1=SLIP, 2=MOUSE, 3=PPP, ..., 29=HCI.
+ */
+#define N_VIRTTY_SLAVE 30
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jules");
@@ -22,6 +26,39 @@ MODULE_DESCRIPTION("Virtual TTY Multiplexer & Console");
 
 static struct tty_driver *virtty_driver;
 static struct virtty_device *virtty_devices[MAX_VIRTTY_DEVICES];
+
+/* Forward declarations */
+static void virtty_free_slave(struct virtty_slave *slave);
+static int virtty_activate_slave(struct virtty_device *vdev, struct virtty_slave *slave, dev_t dev);
+static void virtty_detach_slave(struct virtty_slave *slave);
+
+/* --- Slave Management --- */
+
+static void virtty_free_slave_rcu(struct rcu_head *head)
+{
+	struct virtty_slave *slave = container_of(head, struct virtty_slave, rcu);
+	kfree(slave->name);
+	kfree(slave->options);
+	kfree(slave);
+}
+
+static void virtty_free_slave(struct virtty_slave *slave)
+{
+	if (slave->tty)
+		tty_kclose(slave->tty);
+	call_rcu(&slave->rcu, virtty_free_slave_rcu);
+}
+
+static void virtty_detach_slave(struct virtty_slave *slave)
+{
+	if (!slave->active)
+		return;
+	if (slave->tty) {
+		tty_kclose(slave->tty);
+		slave->tty = NULL;
+	}
+	slave->active = false;
+}
 
 static int virtty_activate_slave(struct virtty_device *vdev, struct virtty_slave *slave, dev_t dev)
 {
@@ -35,14 +72,42 @@ static int virtty_activate_slave(struct virtty_device *vdev, struct virtty_slave
 	slave->tty = tty;
 	tty->disc_data = vdev;
 
-	/* Apply options (e.g. baud rate) */
+	/* Apply options (e.g. 115200n8) */
 	if (slave->options) {
 		struct ktermios termios;
 		speed_t baud;
+		char parity;
+		int bits, stop;
 
-		if (sscanf(slave->options, "%u", &baud) == 1) {
-			termios = tty->termios;
+		termios = tty->termios;
+		if (sscanf(slave->options, "%u%c%d%d", &baud, &parity, &bits, &stop) >= 1) {
 			tty_termios_encode_baud_rate(&termios, baud, baud);
+
+			if (parity == 'n' || parity == 'N') {
+				termios.c_cflag &= ~PARENB;
+			} else if (parity == 'e' || parity == 'E') {
+				termios.c_cflag |= PARENB;
+				termios.c_cflag &= ~PARODD;
+			} else if (parity == 'o' || parity == 'O') {
+				termios.c_cflag |= PARENB;
+				termios.c_cflag |= PARODD;
+			}
+
+			if (bits == 5) {
+				termios.c_cflag &= ~CSIZE; termios.c_cflag |= CS5;
+			} else if (bits == 6) {
+				termios.c_cflag &= ~CSIZE; termios.c_cflag |= CS6;
+			} else if (bits == 7) {
+				termios.c_cflag &= ~CSIZE; termios.c_cflag |= CS7;
+			} else if (bits == 8) {
+				termios.c_cflag &= ~CSIZE; termios.c_cflag |= CS8;
+			}
+
+			if (stop == 2)
+				termios.c_cflag |= CSTOPB;
+			else
+				termios.c_cflag &= ~CSTOPB;
+
 			if (tty->ops->set_termios)
 				tty->ops->set_termios(tty, &termios);
 			else
@@ -82,17 +147,14 @@ static int virtty_add_slave(struct virtty_device *vdev, const char *name, const 
 	return 0;
 }
 
-static int tty_match_name(struct device *dev, const void *data)
-{
-	const char *name = data;
-	return sysfs_streq(dev_name(dev), name);
-}
+/* --- TTY Notifier --- */
 
-static int virtty_check_new_device(struct device *dev, void *data)
+static int virtty_check_device_change(struct device *dev, void *data)
 {
 	int i;
 	struct virtty_slave *slave;
 	const char *name = dev_name(dev);
+	unsigned long action = (unsigned long)data;
 
 	for (i = 0; i < MAX_VIRTTY_DEVICES; i++) {
 		struct virtty_device *vdev = virtty_devices[i];
@@ -100,22 +162,22 @@ static int virtty_check_new_device(struct device *dev, void *data)
 
 		mutex_lock(&vdev->slave_lock);
 		list_for_each_entry(slave, &vdev->slaves, list) {
-			if (!slave->active && sysfs_streq(slave->name, name)) {
-				virtty_activate_slave(vdev, slave, dev->devt);
+			if (sysfs_streq(slave->name, name)) {
+				if (action == TTY_DEVICE_ADD && !slave->active)
+					virtty_activate_slave(vdev, slave, dev->devt);
+				else if (action == TTY_DEVICE_REMOVE && slave->active)
+					virtty_detach_slave(slave);
 			}
 		}
 		mutex_unlock(&vdev->slave_lock);
 	}
-	return 0; /* Keep iterating */
+	return 0;
 }
 
 static int virtty_tty_notifier(struct notifier_block *nb, unsigned long action, void *data)
 {
 	struct device *dev = data;
-
-	if (action == BUS_NOTIFY_ADD_DEVICE) {
-		virtty_check_new_device(dev, NULL);
-	}
+	virtty_check_device_change(dev, (void *)action);
 	return NOTIFY_OK;
 }
 
@@ -123,7 +185,8 @@ static struct notifier_block virtty_nb = {
 	.notifier_call = virtty_tty_notifier,
 };
 
-/* Sysfs Interface */
+/* --- Sysfs Interface --- */
+
 static ssize_t add_slave_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
@@ -147,11 +210,39 @@ static ssize_t add_slave_store(struct device *dev, struct device_attribute *attr
 	virtty_add_slave(vdev, name, options);
 
 	/* Kick the notifier logic manually to see if it already exists */
-	bus_for_each_dev(&tty_bus_type, NULL, (void *)name, (int (*)(struct device *, void *))virtty_check_new_device);
+	class_for_each_device(tty_class, NULL, (void *)(unsigned long)TTY_DEVICE_ADD, virtty_check_device_change);
 
 	return count;
 }
 static DEVICE_ATTR_WO(add_slave);
+
+static ssize_t remove_slave_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct tty_struct *tty = dev_get_drvdata(dev);
+	struct virtty_device *vdev = tty->driver_data;
+	struct virtty_slave *slave, *next;
+	char name[64], *tmp;
+
+	if (count >= sizeof(name))
+		return -EINVAL;
+
+	strscpy(name, buf, sizeof(name));
+	tmp = strchr(name, '\n');
+	if (tmp) *tmp = '\0';
+
+	mutex_lock(&vdev->slave_lock);
+	list_for_each_entry_safe(slave, next, &vdev->slaves, list) {
+		if (sysfs_streq(slave->name, name)) {
+			list_del_rcu(&slave->list);
+			virtty_free_slave(slave);
+		}
+	}
+	mutex_unlock(&vdev->slave_lock);
+
+	return count;
+}
+static DEVICE_ATTR_WO(remove_slave);
 
 static ssize_t slaves_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -173,10 +264,13 @@ static DEVICE_ATTR_RO(slaves);
 
 static struct attribute *virtty_attrs[] = {
 	&dev_attr_add_slave.attr,
+	&dev_attr_remove_slave.attr,
 	&dev_attr_slaves.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(virtty);
+
+/* --- Command Line Parsing --- */
 
 struct virtty_cmdline_cfg {
 	int id;
@@ -185,7 +279,6 @@ struct virtty_cmdline_cfg {
 };
 static struct virtty_cmdline_cfg virtty_cfg[MAX_VIRTTY_DEVICES];
 
-/* Command Line Parsing */
 static int __init virtty_setup(char *str)
 {
 	int id;
@@ -194,7 +287,6 @@ static int __init virtty_setup(char *str)
 	if (!str)
 		return 0;
 
-	/* Format: virtty0=ttyS0,115200:ttyS1,115200 */
 	id_str = strsep(&str, "=");
 	if (!id_str || sscanf(id_str, "virtty%d", &id) != 1)
 		return 0;
@@ -208,28 +300,27 @@ static int __init virtty_setup(char *str)
 
 	return 1;
 }
-__setup("virtty", virtty_setup);
+__setup("virtty=", virtty_setup);
 
-/* Line Discipline: Aggregate data from slave into master */
-static void virtty_slave_receive_buf(struct tty_struct *tty, const unsigned char *cp,
-				    const char *fp, int count)
+/* --- Line Discipline --- */
+
+static void virtty_slave_receive_buf(struct tty_struct *tty, const u8 *cp,
+				    const u8 *fp, size_t count)
 {
 	struct virtty_device *vdev = tty->disc_data;
-	if (vdev && vdev->port.tty) {
-		tty_insert_flip_string(vdev->port.tty, cp, count);
-		tty_flip_submit(vdev->port.tty);
+	if (vdev) {
+		tty_insert_flip_string(&vdev->port, cp, count);
+		tty_flip_submit(&vdev->port);
 	}
 }
 
 static int virtty_slave_open(struct tty_struct *tty)
 {
-	/* Nothing special needed on open */
 	return 0;
 }
 
 static void virtty_slave_close(struct tty_struct *tty)
 {
-	/* Clear reference on close */
 	tty->disc_data = NULL;
 }
 
@@ -242,8 +333,9 @@ static struct tty_ldisc_ops virtty_ldisc_ops = {
 	.receive_buf	= virtty_slave_receive_buf,
 };
 
-/* TTY Operations: Write to all active slaves */
-static int virtty_write(struct tty_struct *tty, const unsigned char *buf, int count)
+/* --- TTY Master Operations --- */
+
+static ssize_t virtty_write(struct tty_struct *tty, const u8 *buf, size_t count)
 {
 	struct virtty_device *vdev = tty->driver_data;
 	struct virtty_slave *slave;
@@ -254,7 +346,6 @@ static int virtty_write(struct tty_struct *tty, const unsigned char *buf, int co
 	mutex_lock(&vdev->slave_lock);
 	list_for_each_entry(slave, &vdev->slaves, list) {
 		if (slave->active && slave->tty && slave->tty->ops->write) {
-			/* Broadcast to slave */
 			slave->tty->ops->write(slave->tty, buf, count);
 		}
 	}
@@ -263,9 +354,9 @@ static int virtty_write(struct tty_struct *tty, const unsigned char *buf, int co
 	return count;
 }
 
-static int virtty_write_room(struct tty_struct *tty)
+static unsigned int virtty_write_room(struct tty_struct *tty)
 {
-	return 2048; /* Arbitrary large buffer room */
+	return 2048;
 }
 
 static int virtty_open(struct tty_struct *tty, struct file *filp)
@@ -289,7 +380,8 @@ static const struct tty_operations virtty_ops = {
 	.write_room = virtty_write_room,
 };
 
-/* Console Implementation: Broadcast printk to slaves */
+/* --- Console --- */
+
 static void virtty_console_write(struct console *co, const char *buf, unsigned int count)
 {
 	struct virtty_device *vdev = virtty_devices[co->index];
@@ -300,20 +392,24 @@ static void virtty_console_write(struct console *co, const char *buf, unsigned i
 
 	/*
 	 * Console writes can happen in atomic context.
-	 * We use rcu_read_lock to safely traverse the list.
+	 * We use mutex_trylock to avoid sleeping while holding
+	 * a lock, and only write if we are not in an atomic
+	 * context where slave TTY writes might sleep.
 	 */
-	rcu_read_lock();
-	list_for_each_entry_rcu(slave, &vdev->slaves, list) {
+	if (!mutex_trylock(&vdev->slave_lock))
+		return;
+
+	list_for_each_entry(slave, &vdev->slaves, list) {
 		if (slave->active && slave->tty && slave->tty->ops->write) {
 			/*
-			 * Note: Slave TTY write might still block/sleep if not
-			 * careful. For serial consoles, we'd ideally use
-			 * the low-level con_write.
+			 * Note: Standard TTY write can sleep.
+			 * We only proceed if it is safe to do so.
 			 */
-			slave->tty->ops->write(slave->tty, (const unsigned char *)buf, count);
+			if (!in_atomic() && !irqs_disabled())
+				slave->tty->ops->write(slave->tty, (const u8 *)buf, count);
 		}
 	}
-	rcu_read_unlock();
+	mutex_unlock(&vdev->slave_lock);
 }
 
 static struct tty_driver *virtty_console_device(struct console *co, int *index)
@@ -321,6 +417,8 @@ static struct tty_driver *virtty_console_device(struct console *co, int *index)
 	*index = co->index;
 	return virtty_driver;
 }
+
+/* --- Initialization & Cleanup --- */
 
 static int __init virtty_init_device(int index)
 {
@@ -337,7 +435,6 @@ static int __init virtty_init_device(int index)
 	mutex_init(&vdev->slave_lock);
 	tty_port_init(&vdev->port);
 
-	/* Setup console structure */
 	snprintf(vdev->console.name, sizeof(vdev->console.name), "virtty");
 	vdev->console.write = virtty_console_write;
 	vdev->console.device = virtty_console_device;
@@ -354,7 +451,6 @@ static int __init virtty_init_device(int index)
 
 	register_console(&vdev->console);
 
-	/* Process command line slaves if any */
 	if (virtty_cfg[index].active && virtty_cfg[index].slaves) {
 		char *s = kstrdup(virtty_cfg[index].slaves, GFP_KERNEL);
 		char *slave_str, *p = s;
@@ -376,18 +472,15 @@ static int __init virtty_init(void)
 {
 	int ret, i;
 
-	/* Register Line Discipline */
-	ret = tty_register_ldisc(N_VIRTTY_SLAVE, &virtty_ldisc_ops);
+	ret = tty_register_ldisc(&virtty_ldisc_ops);
 	if (ret) {
 		pr_err("virtty: failed to register ldisc\n");
 		return ret;
 	}
 
-	bus_register_notifier(&tty_bus_type, &virtty_nb);
-
 	virtty_driver = tty_alloc_driver(MAX_VIRTTY_DEVICES, TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV);
 	if (IS_ERR(virtty_driver)) {
-		tty_unregister_ldisc(N_VIRTTY_SLAVE);
+		tty_unregister_ldisc(&virtty_ldisc_ops);
 		return PTR_ERR(virtty_driver);
 	}
 
@@ -401,37 +494,23 @@ static int __init virtty_init(void)
 
 	ret = tty_register_driver(virtty_driver);
 	if (ret) {
-		put_tty_driver(virtty_driver);
-		tty_unregister_ldisc(N_VIRTTY_SLAVE);
+		tty_driver_kref_put(virtty_driver);
+		tty_unregister_ldisc(&virtty_ldisc_ops);
 		return ret;
 	}
 
-	/* Initialize devices specified in cmdline */
 	for (i = 0; i < MAX_VIRTTY_DEVICES; i++) {
 		if (virtty_cfg[i].active)
 			virtty_init_device(i);
 	}
-
-	/* Always ensure at least virtty0 exists if nothing specified */
 	if (!virtty_cfg[0].active)
 		virtty_init_device(0);
 
+	/* Scan existing TTYs and register for new ones */
+	tty_register_notifier(&virtty_nb);
+	class_for_each_device(tty_class, NULL, (void *)(unsigned long)TTY_DEVICE_ADD, virtty_check_device_change);
+
 	return 0;
-}
-
-static void virtty_free_slave_rcu(struct rcu_head *head)
-{
-	struct virtty_slave *slave = container_of(head, struct virtty_slave, rcu);
-	kfree(slave->name);
-	kfree(slave->options);
-	kfree(slave);
-}
-
-static void virtty_free_slave(struct virtty_slave *slave)
-{
-	if (slave->tty)
-		tty_kclose(slave->tty);
-	call_rcu(&slave->rcu, virtty_free_slave_rcu);
 }
 
 static void __exit virtty_exit(void)
@@ -439,21 +518,19 @@ static void __exit virtty_exit(void)
 	int i;
 	struct virtty_slave *slave, *next;
 
-	bus_unregister_notifier(&tty_bus_type, &virtty_nb);
+	tty_unregister_notifier(&virtty_nb);
+	tty_unregister_driver(virtty_driver);
 
 	for (i = 0; i < MAX_VIRTTY_DEVICES; i++) {
 		struct virtty_device *vdev = virtty_devices[i];
 		if (vdev) {
 			unregister_console(&vdev->console);
-			tty_unregister_device(virtty_driver, i);
-
 			mutex_lock(&vdev->slave_lock);
 			list_for_each_entry_safe(slave, next, &vdev->slaves, list) {
 				list_del_rcu(&slave->list);
 				virtty_free_slave(slave);
 			}
 			mutex_unlock(&vdev->slave_lock);
-
 			tty_port_destroy(&vdev->port);
 			kfree(vdev);
 			virtty_devices[i] = NULL;
@@ -461,9 +538,8 @@ static void __exit virtty_exit(void)
 		if (virtty_cfg[i].slaves)
 			kfree(virtty_cfg[i].slaves);
 	}
-	tty_unregister_driver(virtty_driver);
-	put_tty_driver(virtty_driver);
-	tty_unregister_ldisc(N_VIRTTY_SLAVE);
+	tty_driver_kref_put(virtty_driver);
+	tty_unregister_ldisc(&virtty_ldisc_ops);
 }
 
 module_init(virtty_init);
