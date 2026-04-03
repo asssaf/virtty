@@ -24,7 +24,7 @@ jobs:
 
     - name: Build and install virtty via DKMS
       run: |
-        sudo dkms install virtty/1.0
+        sudo dkms install virtty/1.0 || (sudo cat /var/lib/dkms/virtty/1.0/build/make.log && exit 1)
 
     - name: Verify virtty module exists
       run: |

@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/string.h>
 #include <linux/version.h>
+#include <linux/serial_core.h>
 
 #define DRIVER_NAME "virtty"
 #define DEVICE_NAME "virtty"
@@ -279,6 +280,24 @@ static int __init virtty_init(void) {
                 slave_name = strsep(&options, ",");
 
                 // Search for slave console and proxy options
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+                {
+                    struct console_srcu_iter iter;
+                    int idx;
+
+                    idx = console_srcu_read_lock();
+                    for_each_console_srcu(c, &iter) {
+                        if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
+                            virtty_ports[i]->slave_console = c;
+                            if (options && c->setup) {
+                                c->setup(c, options);
+                            }
+                            break;
+                        }
+                    }
+                    console_srcu_read_unlock(idx);
+                }
+#else
                 console_lock();
                 for_each_console(c) {
                     if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
@@ -290,6 +309,7 @@ static int __init virtty_init(void) {
                     }
                 }
                 console_unlock();
+#endif
                 kfree(config);
             }
 
