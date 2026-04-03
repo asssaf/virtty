@@ -1,4 +1,4 @@
-name: DKMS Verification
+name: build
 
 on:
   push:
