@@ -17,8 +17,7 @@
 #define N_VIRTTY 29 // N_DEVELOPMENT
 
 struct virtty_instance {
-    char slave_name[64];
-    int baud_rate;
+    char slave_config[128];
     int index;
 };
 
@@ -36,8 +35,8 @@ static struct virtty_instance *virtty_instances[MAX_DEVICES];
 static struct tty_driver *virtty_driver;
 
 static void __init virtty_parse_cmdline(void) {
-    char *p, *token, *eq, *comma;
-    int index, baud;
+    char *p, *token, *eq;
+    int index;
     static char cmdline[COMMAND_LINE_SIZE];
 
     strscpy(cmdline, boot_command_line, COMMAND_LINE_SIZE);
@@ -52,22 +51,13 @@ static void __init virtty_parse_cmdline(void) {
         *eq = '\0';
 
         if (sscanf(token, "virtty%d", &index) == 1 && index >= 0 && index < MAX_DEVICES) {
-            char *slave = eq + 1;
-            comma = strchr(slave, ',');
-            if (comma) {
-                *comma = '\0';
-                baud = simple_strtoul(comma + 1, NULL, 10);
-            } else {
-                baud = 115200;
-            }
-
+            char *config = eq + 1;
             if (!virtty_instances[index]) {
                 virtty_instances[index] = kzalloc(sizeof(struct virtty_instance), GFP_KERNEL);
                 if (virtty_instances[index]) {
-                    strscpy(virtty_instances[index]->slave_name, slave, 64);
-                    virtty_instances[index]->baud_rate = baud;
+                    strscpy(virtty_instances[index]->slave_config, config, 128);
                     virtty_instances[index]->index = index;
-                    pr_info("virtty: instance %d configured for slave %s at %d baud\n", index, slave, baud);
+                    pr_info("virtty: instance %d configured with %s\n", index, config);
                 }
             }
         }
@@ -106,7 +96,7 @@ static struct tty_ldisc_ops virtty_ldisc_ops = {
 };
 
 static int virtty_open_slave(struct virtty_port *vport) {
-    char path[128];
+    char path[128], *slave_name, *config, *options;
     struct file *slave_file;
     struct tty_struct *slave_tty;
     int ret = 0;
@@ -117,8 +107,18 @@ static int virtty_open_slave(struct virtty_port *vport) {
         return 0;
     }
 
-    snprintf(path, sizeof(path), "/dev/%s", vport->instance->slave_name);
+    config = kstrdup(vport->instance->slave_config, GFP_KERNEL);
+    if (!config) {
+        mutex_unlock(&vport->lock);
+        return -ENOMEM;
+    }
+    options = config;
+    slave_name = strsep(&options, ",");
+
+    snprintf(path, sizeof(path), "/dev/%s", slave_name);
     slave_file = filp_open(path, O_RDWR | O_NOCTTY, 0);
+    kfree(config);
+
     if (IS_ERR(slave_file)) {
         ret = PTR_ERR(slave_file);
         goto out;
@@ -205,8 +205,6 @@ static void virtty_console_write(struct console *co, const char *s, unsigned int
     struct virtty_port *vport = (co->index >= 0 && co->index < MAX_DEVICES) ? virtty_ports[co->index] : NULL;
 
     if (vport && vport->slave_console && vport->slave_console->write) {
-        // Safe direct call to slave console write.
-        // We assume the caller handles the console lock.
         vport->slave_console->write(vport->slave_console, s, count);
     }
 }
@@ -234,6 +232,7 @@ static struct console virtty_console = {
 static int __init virtty_init(void) {
     int i, ret;
     struct console *c;
+    char *config, *slave_name, *options;
 
     virtty_parse_cmdline();
 
@@ -274,15 +273,24 @@ static int __init virtty_init(void) {
             mutex_init(&virtty_ports[i]->lock);
             tty_port_register_device(&virtty_ports[i]->port, virtty_driver, i, NULL);
 
-            // Locate slave console
-            console_lock();
-            for_each_console(c) {
-                if (strncmp(virtty_instances[i]->slave_name, c->name, strlen(c->name)) == 0) {
-                    virtty_ports[i]->slave_console = c;
-                    break;
+            config = kstrdup(virtty_instances[i]->slave_config, GFP_KERNEL);
+            if (config) {
+                options = config;
+                slave_name = strsep(&options, ",");
+
+                console_lock();
+                for_each_console(c) {
+                    if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
+                        virtty_ports[i]->slave_console = c;
+                        if (options && c->setup) {
+                            c->setup(c, options);
+                        }
+                        break;
+                    }
                 }
+                console_unlock();
+                kfree(config);
             }
-            console_unlock();
         }
     }
 
