@@ -70,6 +70,25 @@ sudo dkms add ./virtty
 sudo dkms install virtty/1.0
 ```
 
+## Device Nodes
+
+If your system uses `devtmpfs` (most modern distributions), device nodes like `/dev/virtty0` will be created automatically when an instance is configured.
+
+If you need to create device nodes manually, find the major number in `/proc/devices` or from the kernel log after loading the module:
+
+```bash
+dmesg | grep virtty
+# Example output: virtty: driver initialized (major 511)
+```
+
+Then create the node (replace `511` with your actual major number):
+
+```bash
+sudo mknod /dev/virtty0 c 511 0
+```
+
+**Note:** The device node will only function correctly if the corresponding `virtty` instance has been configured via the command line or module parameters.
+
 ## Technical Details
 
 - **Device Name:** `virtty`

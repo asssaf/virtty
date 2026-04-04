@@ -67,6 +67,10 @@ static int num_devices;
 module_param_array(devices, charp, &num_devices, 0444);
 MODULE_PARM_DESC(devices, "Instances in format slave,options");
 
+static int major = 0;
+module_param(major, int, 0444);
+MODULE_PARM_DESC(major, "Major number for virtty device (0 = dynamic)");
+
 static int virtty_install(struct tty_driver *driver, struct tty_struct *tty) {
     int index = tty->index;
     if (index >= MAX_DEVICES || !virtty_ports[index])
@@ -227,7 +231,7 @@ static int __init virtty_init(void) {
 
     virtty_driver->driver_name = DRIVER_NAME;
     virtty_driver->name = DEVICE_NAME;
-    virtty_driver->major = 0;
+    virtty_driver->major = major;
     virtty_driver->minor_start = 0;
     virtty_driver->type = TTY_DRIVER_TYPE_SERIAL;
     virtty_driver->subtype = SERIAL_TYPE_NORMAL;
@@ -294,7 +298,7 @@ static int __init virtty_init(void) {
         }
     }
 
-    pr_info("virtty: driver initialized\n");
+    pr_info("virtty: driver initialized (major %d)\n", virtty_driver->major);
     return 0;
 
 err_ports:
