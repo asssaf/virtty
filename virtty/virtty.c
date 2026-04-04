@@ -10,6 +10,7 @@
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/string.h>
+#include <linux/ctype.h>
 #include <linux/version.h>
 #include <linux/serial_core.h>
 
@@ -40,71 +41,6 @@ static struct tty_driver *virtty_driver;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 #define tty_driver_kref_put(x) put_tty_driver(x)
 #endif
-
-static void virtty_add_instance(int index, const char *config) {
-    if (index >= 0 && index < MAX_DEVICES && config && !virtty_instances[index]) {
-        virtty_instances[index] = kzalloc(sizeof(struct virtty_instance), GFP_KERNEL);
-        if (virtty_instances[index]) {
-            strscpy(virtty_instances[index]->slave_config, config, 128);
-            virtty_instances[index]->index = index;
-            pr_info("virtty: instance %d configured with %s\n", index, config);
-        }
-    }
-}
-
-// Support virtty0=... through virtty7=... for built-in kernel usage
-#define VIRTTY_SETUP(n) \
-static int __init virtty_setup_##n(char *str) { \
-    virtty_add_instance(n, str); \
-    return 1; \
-} \
-__setup("virtty"#n"=", virtty_setup_##n);
-
-VIRTTY_SETUP(0) VIRTTY_SETUP(1) VIRTTY_SETUP(2) VIRTTY_SETUP(3)
-VIRTTY_SETUP(4) VIRTTY_SETUP(5) VIRTTY_SETUP(6) VIRTTY_SETUP(7)
-
-// Module parameters for loadable module usage
-static char *v0, *v1, *v2, *v3, *v4, *v5, *v6, *v7;
-module_param_named(virtty0, v0, charp, 0444);
-module_param_named(virtty1, v1, charp, 0444);
-module_param_named(virtty2, v2, charp, 0444);
-module_param_named(virtty3, v3, charp, 0444);
-module_param_named(virtty4, v4, charp, 0444);
-module_param_named(virtty5, v5, charp, 0444);
-module_param_named(virtty6, v6, charp, 0444);
-module_param_named(virtty7, v7, charp, 0444);
-
-static int major = 0;
-module_param(major, int, 0444);
-MODULE_PARM_DESC(major, "Major number for virtty device (0 = dynamic)");
-
-static int virtty_install(struct tty_driver *driver, struct tty_struct *tty) {
-    int index = tty->index;
-    if (index >= MAX_DEVICES || !virtty_ports[index])
-        return -ENODEV;
-    tty->port = &virtty_ports[index]->port;
-    return tty_standard_install(driver, tty);
-}
-
-static void virtty_receive_buf(struct tty_struct *tty, const u8 *cp, const u8 *fp, size_t count) {
-    struct virtty_port *vport = tty->disc_data;
-    if (vport && vport->port.itty) {
-        tty_insert_flip_string(&vport->port, cp, count);
-        tty_flip_buffer_push(&vport->port);
-    }
-}
-
-static int virtty_ldisc_open(struct tty_struct *tty) { return 0; }
-static void virtty_ldisc_close(struct tty_struct *tty) {}
-
-static struct tty_ldisc_ops virtty_ldisc_ops = {
-    .owner = THIS_MODULE,
-    .num = N_VIRTTY,
-    .name = "virtty_ldisc",
-    .open = virtty_ldisc_open,
-    .close = virtty_ldisc_close,
-    .receive_buf = virtty_receive_buf,
-};
 
 static int virtty_open_slave(struct virtty_port *vport) {
     char path[128], *slave_name, *config, *options;
@@ -160,13 +96,101 @@ out:
     return ret;
 }
 
+static int virtty_port_activate(struct tty_port *port, struct tty_struct *tty) {
+    struct virtty_port *vport = container_of(port, struct virtty_port, port);
+    return virtty_open_slave(vport);
+}
+
+static void virtty_port_shutdown(struct tty_port *port) {
+    struct virtty_port *vport = container_of(port, struct virtty_port, port);
+    mutex_lock(&vport->lock);
+    if (vport->slave_tty) {
+        tty_kclose(vport->slave_tty);
+        vport->slave_tty = NULL;
+    }
+    if (vport->slave_file) {
+        filp_close(vport->slave_file, NULL);
+        vport->slave_file = NULL;
+    }
+    mutex_unlock(&vport->lock);
+}
+
+static const struct tty_port_operations virtty_port_ops = {
+    .activate = virtty_port_activate,
+    .shutdown = virtty_port_shutdown,
+};
+
+static void virtty_add_instance(int index, const char *config) {
+    if (index >= 0 && index < MAX_DEVICES && config && !virtty_instances[index]) {
+        virtty_instances[index] = kzalloc(sizeof(struct virtty_instance), GFP_KERNEL);
+        if (virtty_instances[index]) {
+            strscpy(virtty_instances[index]->slave_config, config, 128);
+            virtty_instances[index]->index = index;
+            pr_info("virtty: instance %d configured with %s\n", index, config);
+        }
+    }
+}
+
+#define VIRTTY_SETUP(n) \
+static int __init virtty_setup_##n(char *str) { \
+    virtty_add_instance(n, str); \
+    return 1; \
+} \
+__setup("virtty"#n"=", virtty_setup_##n);
+
+VIRTTY_SETUP(0) VIRTTY_SETUP(1) VIRTTY_SETUP(2) VIRTTY_SETUP(3)
+VIRTTY_SETUP(4) VIRTTY_SETUP(5) VIRTTY_SETUP(6) VIRTTY_SETUP(7)
+
+// Module parameters
+static char *v0, *v1, *v2, *v3, *v4, *v5, *v6, *v7;
+module_param_named(virtty0, v0, charp, 0444);
+module_param_named(virtty1, v1, charp, 0444);
+module_param_named(virtty2, v2, charp, 0444);
+module_param_named(virtty3, v3, charp, 0444);
+module_param_named(virtty4, v4, charp, 0444);
+module_param_named(virtty5, v5, charp, 0444);
+module_param_named(virtty6, v6, charp, 0444);
+module_param_named(virtty7, v7, charp, 0444);
+
+static int major = 0;
+module_param(major, int, 0444);
+MODULE_PARM_DESC(major, "Major number for virtty device (0 = dynamic)");
+
+static int virtty_install(struct tty_driver *driver, struct tty_struct *tty) {
+    int index = tty->index;
+    struct virtty_port *vport;
+
+    if (index >= MAX_DEVICES || !virtty_ports[index])
+        return -ENODEV;
+
+    vport = virtty_ports[index];
+    tty->driver_data = vport;
+    tty_port_install(&vport->port, driver, tty);
+    return 0;
+}
+
+static void virtty_receive_buf(struct tty_struct *tty, const u8 *cp, const u8 *fp, size_t count) {
+    struct virtty_port *vport = tty->disc_data;
+    if (vport && vport->port.itty) {
+        tty_insert_flip_string(&vport->port, cp, count);
+        tty_flip_buffer_push(&vport->port);
+    }
+}
+
+static int virtty_ldisc_open(struct tty_struct *tty) { return 0; }
+static void virtty_ldisc_close(struct tty_struct *tty) {}
+
+static struct tty_ldisc_ops virtty_ldisc_ops = {
+    .owner = THIS_MODULE,
+    .num = N_VIRTTY,
+    .name = "virtty_ldisc",
+    .open = virtty_ldisc_open,
+    .close = virtty_ldisc_close,
+    .receive_buf = virtty_receive_buf,
+};
+
 static int virtty_open(struct tty_struct *tty, struct file *file) {
-    struct virtty_port *vport = container_of(tty->port, struct virtty_port, port);
-    int ret = tty_port_open(tty->port, tty, file);
-    if (ret) return ret;
-    ret = virtty_open_slave(vport);
-    if (ret) tty_port_close(tty->port, tty, file);
-    return ret;
+    return tty_port_open(tty->port, tty, file);
 }
 
 static void virtty_close(struct tty_struct *tty, struct file *file) {
@@ -174,22 +198,22 @@ static void virtty_close(struct tty_struct *tty, struct file *file) {
 }
 
 static ssize_t virtty_write(struct tty_struct *tty, const u8 *buffer, size_t count) {
-    struct virtty_port *vport = container_of(tty->port, struct virtty_port, port);
-    if (vport->slave_tty && vport->slave_tty->ops->write)
+    struct virtty_port *vport = tty->driver_data;
+    if (vport && vport->slave_tty && vport->slave_tty->ops->write)
         return vport->slave_tty->ops->write(vport->slave_tty, buffer, count);
     return 0;
 }
 
 static unsigned int virtty_write_room(struct tty_struct *tty) {
-    struct virtty_port *vport = container_of(tty->port, struct virtty_port, port);
-    if (vport->slave_tty && vport->slave_tty->ops->write_room)
+    struct virtty_port *vport = tty->driver_data;
+    if (vport && vport->slave_tty && vport->slave_tty->ops->write_room)
         return vport->slave_tty->ops->write_room(vport->slave_tty);
     return 2048;
 }
 
 static void virtty_set_termios(struct tty_struct *tty, const struct ktermios *old) {
-    struct virtty_port *vport = container_of(tty->port, struct virtty_port, port);
-    if (vport->slave_tty && vport->slave_tty->ops->set_termios)
+    struct virtty_port *vport = tty->driver_data;
+    if (vport && vport->slave_tty && vport->slave_tty->ops->set_termios)
         vport->slave_tty->ops->set_termios(vport->slave_tty, &tty->termios);
 }
 
@@ -214,8 +238,7 @@ static struct tty_driver *virtty_console_device(struct console *co, int *index) 
 }
 
 static int virtty_console_setup(struct console *co, char *options) {
-    struct virtty_port *vport = container_of(co, struct virtty_port, console);
-    return vport ? 0 : -ENODEV;
+    return 0;
 }
 
 static int __init virtty_init(void) {
@@ -256,14 +279,20 @@ static int __init virtty_init(void) {
             if (!virtty_ports[i]) { ret = -ENOMEM; goto err_ports; }
             virtty_ports[i]->instance = virtty_instances[i];
             tty_port_init(&virtty_ports[i]->port);
+            virtty_ports[i]->port.ops = &virtty_port_ops;
             mutex_init(&virtty_ports[i]->lock);
             tty_port_register_device(&virtty_ports[i]->port, virtty_driver, i, NULL);
 
             config = kstrdup(virtty_instances[i]->slave_config, GFP_KERNEL);
             if (config) {
+                int slave_index = 0;
                 options = config;
                 slave_name = strsep(&options, ",");
                 if (slave_name) {
+                    char *p_name = slave_name;
+                    while (*p_name && !isdigit(*p_name)) p_name++;
+                    if (*p_name) sscanf(p_name, "%d", &slave_index);
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
                     int idx = console_srcu_read_lock();
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
@@ -272,7 +301,7 @@ static int __init virtty_init(void) {
                     struct console_srcu_iter iter;
                     for_each_console_srcu(c, &iter) {
 #endif
-                        if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
+                        if (strncmp(slave_name, c->name, strlen(c->name)) == 0 && (c->index == -1 || c->index == slave_index)) {
                             virtty_ports[i]->slave_console = c;
                             if (options && c->setup) c->setup(c, options);
                             break;
@@ -282,7 +311,7 @@ static int __init virtty_init(void) {
 #else
                     console_lock();
                     for_each_console(c) {
-                        if (strncmp(slave_name, c->name, strlen(c->name)) == 0) {
+                        if (strncmp(slave_name, c->name, strlen(c->name)) == 0 && (c->index == -1 || c->index == slave_index)) {
                             virtty_ports[i]->slave_console = c;
                             if (options && c->setup) c->setup(c, options);
                             break;
