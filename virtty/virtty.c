@@ -299,6 +299,11 @@ static int __init virtty_init(void) {
     }
 
     pr_info("virtty: driver initialized (major %d)\n", virtty_driver->major);
+    for (i = 0; i < MAX_DEVICES; i++) {
+        if (virtty_instances[i]) {
+            pr_info("virtty: virtty%d linked to slave %s\n", i, virtty_instances[i]->slave_config);
+        }
+    }
     return 0;
 
 err_ports:
