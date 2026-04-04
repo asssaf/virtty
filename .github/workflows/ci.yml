@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  dkms-verify:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y dkms linux-headers-$(uname -r)
+
+    - name: Add virtty to DKMS
+      run: |
+        sudo dkms add ./virtty
+
+    - name: Build and install virtty via DKMS
+      run: |
+        sudo dkms install virtty/1.0 || (sudo cat /var/lib/dkms/virtty/1.0/build/make.log && exit 1)
+
+    - name: Verify virtty module exists
+      run: |
+        modinfo virtty || (echo "virtty module not found" && exit 1)
+
+    - name: Cleanup DKMS
+      if: always()
+      run: |
+        sudo dkms remove virtty/1.0 --all || true

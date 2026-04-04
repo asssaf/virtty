@@ -1,0 +1,387 @@
+#include <linux/module.h>
+#include <linux/tty.h>
+#include <linux/tty_driver.h>
+#include <linux/tty_flip.h>
+#include <linux/console.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/file.h>
+#include <linux/fcntl.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
+#include <linux/string.h>
+#include <linux/ctype.h>
+#include <linux/version.h>
+#include <linux/serial_core.h>
+
+#define DRIVER_NAME "virtty"
+#define DEVICE_NAME "virtty"
+#define MAX_DEVICES 8
+#define N_VIRTTY 29 // N_DEVELOPMENT
+
+struct virtty_instance {
+    char slave_config[128];
+    int index;
+};
+
+struct virtty_port {
+    struct tty_port port;
+    struct virtty_instance *instance;
+    struct tty_struct *slave_tty;
+    struct file *slave_file;
+    struct mutex lock;
+    struct console console;
+    struct console *slave_console;
+};
+
+static struct virtty_port *virtty_ports[MAX_DEVICES];
+static struct virtty_instance *virtty_instances[MAX_DEVICES];
+static struct tty_driver *virtty_driver;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
+#define tty_driver_kref_put(x) put_tty_driver(x)
+#endif
+
+static int virtty_open_slave(struct virtty_port *vport) {
+    char path[128], *slave_name, *config, *options;
+    struct file *slave_file;
+    struct tty_struct *slave_tty;
+    int ret = 0;
+
+    mutex_lock(&vport->lock);
+    if (vport->slave_tty) {
+        mutex_unlock(&vport->lock);
+        return 0;
+    }
+
+    config = kstrdup(vport->instance->slave_config, GFP_KERNEL);
+    if (!config) {
+        mutex_unlock(&vport->lock);
+        return -ENOMEM;
+    }
+    options = config;
+    slave_name = strsep(&options, ",");
+
+    snprintf(path, sizeof(path), "/dev/%s", slave_name);
+    slave_file = filp_open(path, O_RDWR | O_NOCTTY, 0);
+    kfree(config);
+
+    if (IS_ERR(slave_file)) {
+        ret = PTR_ERR(slave_file);
+        goto out;
+    }
+    vport->slave_file = slave_file;
+
+    slave_tty = tty_kopen_exclusive(vport->slave_file->f_path.dentry->d_inode->i_rdev);
+    if (IS_ERR(slave_tty)) {
+        filp_close(vport->slave_file, NULL);
+        vport->slave_file = NULL;
+        ret = PTR_ERR(slave_tty);
+        goto out;
+    }
+    vport->slave_tty = slave_tty;
+
+    ret = tty_set_ldisc(slave_tty, N_VIRTTY);
+    if (ret) {
+        tty_kclose(vport->slave_tty);
+        vport->slave_tty = NULL;
+        filp_close(vport->slave_file, NULL);
+        vport->slave_file = NULL;
+        goto out;
+    }
+    slave_tty->disc_data = vport;
+
+out:
+    mutex_unlock(&vport->lock);
+    return ret;
+}
+
+static int virtty_port_activate(struct tty_port *port, struct tty_struct *tty) {
+    struct virtty_port *vport = container_of(port, struct virtty_port, port);
+    return virtty_open_slave(vport);
+}
+
+static void virtty_port_shutdown(struct tty_port *port) {
+    struct virtty_port *vport = container_of(port, struct virtty_port, port);
+    mutex_lock(&vport->lock);
+    if (vport->slave_tty) {
+        tty_kclose(vport->slave_tty);
+        vport->slave_tty = NULL;
+    }
+    if (vport->slave_file) {
+        filp_close(vport->slave_file, NULL);
+        vport->slave_file = NULL;
+    }
+    mutex_unlock(&vport->lock);
+}
+
+static const struct tty_port_operations virtty_port_ops = {
+    .activate = virtty_port_activate,
+    .shutdown = virtty_port_shutdown,
+};
+
+static void virtty_add_instance(int index, const char *config) {
+    if (index >= 0 && index < MAX_DEVICES && config && !virtty_instances[index]) {
+        virtty_instances[index] = kzalloc(sizeof(struct virtty_instance), GFP_KERNEL);
+        if (virtty_instances[index]) {
+            strscpy(virtty_instances[index]->slave_config, config, 128);
+            virtty_instances[index]->index = index;
+            pr_info("virtty: instance %d configured with %s\n", index, config);
+        }
+    }
+}
+
+#define VIRTTY_SETUP(n) \
+static int __init virtty_setup_##n(char *str) { \
+    virtty_add_instance(n, str); \
+    return 1; \
+} \
+__setup("virtty"#n"=", virtty_setup_##n);
+
+VIRTTY_SETUP(0) VIRTTY_SETUP(1) VIRTTY_SETUP(2) VIRTTY_SETUP(3)
+VIRTTY_SETUP(4) VIRTTY_SETUP(5) VIRTTY_SETUP(6) VIRTTY_SETUP(7)
+
+// Module parameters
+static char *v0, *v1, *v2, *v3, *v4, *v5, *v6, *v7;
+module_param_named(virtty0, v0, charp, 0444);
+module_param_named(virtty1, v1, charp, 0444);
+module_param_named(virtty2, v2, charp, 0444);
+module_param_named(virtty3, v3, charp, 0444);
+module_param_named(virtty4, v4, charp, 0444);
+module_param_named(virtty5, v5, charp, 0444);
+module_param_named(virtty6, v6, charp, 0444);
+module_param_named(virtty7, v7, charp, 0444);
+
+static int major = 0;
+module_param(major, int, 0444);
+MODULE_PARM_DESC(major, "Major number for virtty device (0 = dynamic)");
+
+static int virtty_install(struct tty_driver *driver, struct tty_struct *tty) {
+    int index = tty->index;
+    struct virtty_port *vport;
+
+    if (index >= MAX_DEVICES || !virtty_ports[index])
+        return -ENODEV;
+
+    vport = virtty_ports[index];
+    tty->driver_data = vport;
+    tty_port_install(&vport->port, driver, tty);
+    return 0;
+}
+
+static void virtty_receive_buf(struct tty_struct *tty, const u8 *cp, const u8 *fp, size_t count) {
+    struct virtty_port *vport = tty->disc_data;
+    if (vport && vport->port.itty) {
+        tty_insert_flip_string(&vport->port, cp, count);
+        tty_flip_buffer_push(&vport->port);
+    }
+}
+
+static int virtty_ldisc_open(struct tty_struct *tty) { return 0; }
+static void virtty_ldisc_close(struct tty_struct *tty) {}
+
+static struct tty_ldisc_ops virtty_ldisc_ops = {
+    .owner = THIS_MODULE,
+    .num = N_VIRTTY,
+    .name = "virtty_ldisc",
+    .open = virtty_ldisc_open,
+    .close = virtty_ldisc_close,
+    .receive_buf = virtty_receive_buf,
+};
+
+static int virtty_open(struct tty_struct *tty, struct file *file) {
+    return tty_port_open(tty->port, tty, file);
+}
+
+static void virtty_close(struct tty_struct *tty, struct file *file) {
+    tty_port_close(tty->port, tty, file);
+}
+
+static ssize_t virtty_write(struct tty_struct *tty, const u8 *buffer, size_t count) {
+    struct virtty_port *vport = tty->driver_data;
+    if (vport && vport->slave_tty && vport->slave_tty->ops->write)
+        return vport->slave_tty->ops->write(vport->slave_tty, buffer, count);
+    return 0;
+}
+
+static unsigned int virtty_write_room(struct tty_struct *tty) {
+    struct virtty_port *vport = tty->driver_data;
+    if (vport && vport->slave_tty && vport->slave_tty->ops->write_room)
+        return vport->slave_tty->ops->write_room(vport->slave_tty);
+    return 2048;
+}
+
+static void virtty_set_termios(struct tty_struct *tty, const struct ktermios *old) {
+    struct virtty_port *vport = tty->driver_data;
+    if (vport && vport->slave_tty && vport->slave_tty->ops->set_termios)
+        vport->slave_tty->ops->set_termios(vport->slave_tty, &tty->termios);
+}
+
+static const struct tty_operations virtty_ops = {
+    .install = virtty_install,
+    .open = virtty_open,
+    .close = virtty_close,
+    .write = virtty_write,
+    .write_room = virtty_write_room,
+    .set_termios = virtty_set_termios,
+};
+
+static void virtty_console_write(struct console *co, const char *s, unsigned int count) {
+    struct virtty_port *vport = container_of(co, struct virtty_port, console);
+    if (vport && vport->slave_console && vport->slave_console->write)
+        vport->slave_console->write(vport->slave_console, s, count);
+}
+
+static struct tty_driver *virtty_console_device(struct console *co, int *index) {
+    *index = co->index;
+    return virtty_driver;
+}
+
+static int virtty_console_setup(struct console *co, char *options) {
+    return 0;
+}
+
+static int __init virtty_init(void) {
+    int i, ret;
+    struct console *c;
+    char *config, *slave_name, *options;
+    char *p_params[] = { v0, v1, v2, v3, v4, v5, v6, v7 };
+
+    for (i = 0; i < MAX_DEVICES; i++) {
+        if (p_params[i]) virtty_add_instance(i, p_params[i]);
+    }
+
+    ret = tty_register_ldisc(&virtty_ldisc_ops);
+    if (ret) return ret;
+
+    virtty_driver = tty_alloc_driver(MAX_DEVICES, TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV);
+    if (IS_ERR(virtty_driver)) {
+        ret = PTR_ERR(virtty_driver);
+        goto err_ldisc;
+    }
+
+    virtty_driver->driver_name = DRIVER_NAME;
+    virtty_driver->name = DEVICE_NAME;
+    virtty_driver->major = major;
+    virtty_driver->minor_start = 0;
+    virtty_driver->type = TTY_DRIVER_TYPE_SERIAL;
+    virtty_driver->subtype = SERIAL_TYPE_NORMAL;
+    virtty_driver->init_termios = tty_std_termios;
+    virtty_driver->init_termios.c_cflag = B115200 | CS8 | CREAD | HUPCL | CLOCAL;
+    tty_set_operations(virtty_driver, &virtty_ops);
+
+    ret = tty_register_driver(virtty_driver);
+    if (ret) goto err_put;
+
+    for (i = 0; i < MAX_DEVICES; i++) {
+        if (virtty_instances[i]) {
+            virtty_ports[i] = kzalloc(sizeof(struct virtty_port), GFP_KERNEL);
+            if (!virtty_ports[i]) { ret = -ENOMEM; goto err_ports; }
+            virtty_ports[i]->instance = virtty_instances[i];
+            tty_port_init(&virtty_ports[i]->port);
+            virtty_ports[i]->port.ops = &virtty_port_ops;
+            mutex_init(&virtty_ports[i]->lock);
+            tty_port_register_device(&virtty_ports[i]->port, virtty_driver, i, NULL);
+
+            config = kstrdup(virtty_instances[i]->slave_config, GFP_KERNEL);
+            if (config) {
+                int slave_index = 0;
+                options = config;
+                slave_name = strsep(&options, ",");
+                if (slave_name) {
+                    char *p_name = slave_name;
+                    while (*p_name && !isdigit(*p_name)) p_name++;
+                    if (*p_name) sscanf(p_name, "%d", &slave_index);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+                    int idx = console_srcu_read_lock();
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+                    for_each_console_srcu(c) {
+#else
+                    struct console_srcu_iter iter;
+                    for_each_console_srcu(c, &iter) {
+#endif
+                        if (strncmp(slave_name, c->name, strlen(c->name)) == 0 && (c->index == -1 || c->index == slave_index)) {
+                            virtty_ports[i]->slave_console = c;
+                            if (options && c->setup) c->setup(c, options);
+                            break;
+                        }
+                    }
+                    console_srcu_read_unlock(idx);
+#else
+                    console_lock();
+                    for_each_console(c) {
+                        if (strncmp(slave_name, c->name, strlen(c->name)) == 0 && (c->index == -1 || c->index == slave_index)) {
+                            virtty_ports[i]->slave_console = c;
+                            if (options && c->setup) c->setup(c, options);
+                            break;
+                        }
+                    }
+                    console_unlock();
+#endif
+                }
+                kfree(config);
+            }
+
+            strscpy(virtty_ports[i]->console.name, DEVICE_NAME, sizeof(virtty_ports[i]->console.name));
+            virtty_ports[i]->console.write = virtty_console_write;
+            virtty_ports[i]->console.device = virtty_console_device;
+            virtty_ports[i]->console.setup = virtty_console_setup;
+            virtty_ports[i]->console.flags = CON_PRINTBUFFER | CON_ANYTIME | CON_ENABLED;
+            virtty_ports[i]->console.index = i;
+            register_console(&virtty_ports[i]->console);
+        }
+    }
+
+    pr_info("virtty: driver initialized (major %d)\n", virtty_driver->major);
+    for (i = 0; i < MAX_DEVICES; i++) {
+        if (virtty_instances[i]) {
+            pr_info("virtty: virtty%d linked to slave %s\n", i, virtty_instances[i]->slave_config);
+        }
+    }
+    return 0;
+
+err_ports:
+    for (i = 0; i < MAX_DEVICES; i++) {
+        if (virtty_ports[i]) {
+            unregister_console(&virtty_ports[i]->console);
+            tty_unregister_device(virtty_driver, i);
+            tty_port_destroy(&virtty_ports[i]->port);
+            kfree(virtty_ports[i]);
+        }
+    }
+    tty_unregister_driver(virtty_driver);
+err_put:
+    tty_driver_kref_put(virtty_driver);
+err_ldisc:
+    tty_unregister_ldisc(&virtty_ldisc_ops);
+    for (i = 0; i < MAX_DEVICES; i++) {
+        if (virtty_instances[i]) kfree(virtty_instances[i]);
+    }
+    return ret;
+}
+
+static void __exit virtty_exit(void) {
+    int i;
+    for (i = 0; i < MAX_DEVICES; i++) {
+        if (virtty_ports[i]) {
+            unregister_console(&virtty_ports[i]->console);
+            if (virtty_ports[i]->slave_tty) tty_kclose(virtty_ports[i]->slave_tty);
+            if (virtty_ports[i]->slave_file) filp_close(virtty_ports[i]->slave_file, NULL);
+            tty_unregister_device(virtty_driver, i);
+            tty_port_destroy(&virtty_ports[i]->port);
+            kfree(virtty_ports[i]);
+        }
+        if (virtty_instances[i]) kfree(virtty_instances[i]);
+    }
+    tty_unregister_ldisc(&virtty_ldisc_ops);
+    tty_unregister_driver(virtty_driver);
+    tty_driver_kref_put(virtty_driver);
+}
+
+module_init(virtty_init);
+module_exit(virtty_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Jules");
+MODULE_DESCRIPTION("Virtual TTY device multiplexer/proxy");
