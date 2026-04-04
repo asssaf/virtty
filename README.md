@@ -30,16 +30,16 @@ This will:
 
 ### Module Usage
 
-When loaded as a module, use the `devices` parameter to configure instances (the first entry corresponds to `virtty0`, the second to `virtty1`, and so on):
+When loaded as a module, use named parameters `virtty0` through `virtty7` to configure instances:
 
 ```bash
-sudo modprobe virtty devices=ttyS0,115200
+sudo modprobe virtty virtty0=ttyAMA0,115200
 ```
 
 Or via the kernel command line:
 
 ```
-virtty.devices=ttyS0,115200 console=virtty0
+virtty.virtty0=ttyAMA0,115200 console=virtty0
 ```
 
 **Note:** For `console=virttyN` to capture early boot messages (before modules are loaded), the `virtty` module must be built into the kernel image. As a loadable module, it will start proxying console output as soon as it is loaded and initialized.

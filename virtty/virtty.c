@@ -52,6 +52,7 @@ static void virtty_add_instance(int index, const char *config) {
     }
 }
 
+// Support virtty0=... through virtty7=... for built-in kernel usage
 #define VIRTTY_SETUP(n) \
 static int __init virtty_setup_##n(char *str) { \
     virtty_add_instance(n, str); \
@@ -62,10 +63,16 @@ __setup("virtty"#n"=", virtty_setup_##n);
 VIRTTY_SETUP(0) VIRTTY_SETUP(1) VIRTTY_SETUP(2) VIRTTY_SETUP(3)
 VIRTTY_SETUP(4) VIRTTY_SETUP(5) VIRTTY_SETUP(6) VIRTTY_SETUP(7)
 
-static char *devices[MAX_DEVICES];
-static int num_devices;
-module_param_array(devices, charp, &num_devices, 0444);
-MODULE_PARM_DESC(devices, "Instances in format slave,options");
+// Module parameters for loadable module usage
+static char *v0, *v1, *v2, *v3, *v4, *v5, *v6, *v7;
+module_param_named(virtty0, v0, charp, 0444);
+module_param_named(virtty1, v1, charp, 0444);
+module_param_named(virtty2, v2, charp, 0444);
+module_param_named(virtty3, v3, charp, 0444);
+module_param_named(virtty4, v4, charp, 0444);
+module_param_named(virtty5, v5, charp, 0444);
+module_param_named(virtty6, v6, charp, 0444);
+module_param_named(virtty7, v7, charp, 0444);
 
 static int major = 0;
 module_param(major, int, 0444);
@@ -215,9 +222,10 @@ static int __init virtty_init(void) {
     int i, ret;
     struct console *c;
     char *config, *slave_name, *options;
+    char *p_params[] = { v0, v1, v2, v3, v4, v5, v6, v7 };
 
-    for (i = 0; i < num_devices; i++) {
-        if (devices[i]) virtty_add_instance(i, devices[i]);
+    for (i = 0; i < MAX_DEVICES; i++) {
+        if (p_params[i]) virtty_add_instance(i, p_params[i]);
     }
 
     ret = tty_register_ldisc(&virtty_ldisc_ops);
@@ -256,7 +264,6 @@ static int __init virtty_init(void) {
                 options = config;
                 slave_name = strsep(&options, ",");
                 if (slave_name) {
-#ifndef MODULE
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
                     int idx = console_srcu_read_lock();
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
@@ -282,7 +289,6 @@ static int __init virtty_init(void) {
                         }
                     }
                     console_unlock();
-#endif
 #endif
                 }
                 kfree(config);
